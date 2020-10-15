@@ -1,0 +1,435 @@
+{% load branding i18n %}
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta content='text/html; charset=utf-8' http-equiv='Content-Type' />
+    {% include "horizon/_custom_meta.html" %}
+    <title>{% block title %}{% endblock %} - {% site_branding %}</title>
+<STYLE type="text/css">
+.likeabutton {
+    text-decoration: none; font: menu;
+    display: inline-block; padding: 2px 8px;
+    background: ButtonFace; color: ButtonText;
+    border-style: solid; border-width: 2px;
+    border-color: ButtonHighlight ButtonShadow ButtonShadow ButtonHighlight;
+}
+.likeabutton:active {
+    border-color: ButtonShadow ButtonHighlight ButtonHighlight ButtonShadow;
+}
+</STYLE>
+    {% comment %} Load CSS sheets before Javascript  {% endcomment %}
+    {% block css %}
+      {% include "_stylesheets.html" %}
+    {% endblock %}
+    {% include "horizon/_conf.html" %}
+    {% include "horizon/client_side/_script_loader.html" %}
+    {% include "horizon/_custom_head_js.html" %}
+  </head>
+  <body id="{% block body_id %}{% endblock %}" ng-app='hz'>
+    <script>
+$( document ).ready(function() {
+    var __project__ = 'my-project-for-metadata';
+    var __address__ = '/rest/metadata';
+    var __count__ = 0;
+    var __empty__ = true;
+	var btn_add_metadata_keypair = null;
+	var __can_delete__ = false;
+
+    function uuid() {
+	    return (new Date().getTime() + "" + Math.floor(65535 * Math.random()));
+    }
+
+	function populate_item_add_button() {
+		return '<NOBR>&nbsp;&nbsp;<button id="btn-add-metadata" title="Click this button to Add a new Key/Value Pair">ADD</button></NOBR>';
+	}
+	
+	function clear_metadata_items() {
+	}
+
+    function numerics(s) {
+	  var ch;
+	  var n;
+	  var val = '';
+	  var value = -1;
+	  for (var i = 0; i < s.length; i++) {
+		  ch = s.substr(i,1);
+		  n = parseInt(ch);
+		  if (n) {
+			  val += ch;
+		  }
+	  }
+	  if (val.length > 0) {
+		  value = parseInt(val);
+	  }
+	  return value;
+    }
+
+    function collect_keypairs(pairs) {
+		var p;
+		var __keys__;
+		var id_keyname;
+		var id_value;
+		var keyval;
+		var valval;
+		var total = 0;
+		var count_visible = 0;
+		var count_hidden = 0;
+		var count_valid = 0;
+		var is_visible = false;
+		var is_key_visible = false;
+		var is_val_visible = false;
+		var next_available_keypair = [];
+		for (var i = 0; i < pairs.length; i++) {
+			p = pairs[i];
+			__keys__ = [];
+			for (var k in p) {
+				__keys__[__keys__.length+1] = k;
+				if (k.indexOf('id_key') > -1) {
+					id_keyname = k;
+				} else if (k.indexOf('id_value') > -1) {
+					id_value = k;
+				}
+			}
+			p[id_keyname] = $('#'+id_keyname);
+			keyval = p[id_keyname].val();
+			is_key_visible = p[id_keyname].is(":visible");
+			p[id_value] = $('#'+id_value);
+			valval = p[id_value].val();
+			is_val_visible = p[id_value].is(":visible");
+			is_valid = (keyval != "") && (valval != "");
+			is_visible = (is_key_visible) && (is_val_visible);
+			if (is_valid && is_visible) {
+				count_valid++;
+			}
+			if (is_visible) {
+				count_visible++;
+			} else {
+				count_hidden++;
+				if (next_available_keypair.length == 0) {
+					next_available_keypair = {'id_keyname':p[id_keyname],'id_value':p[id_value],'parent':p['parent'],'buttons':p['buttons']};
+				}
+			}
+			total++;
+		}
+		return {'all_visible_are_valid':count_valid == count_visible,'count_valid':count_valid,'count_visible':count_visible,'count_hidden':count_hidden,'total':total,'next_available_keypair':next_available_keypair};
+	}
+	
+    function delete_keypair(num,pairs,hidden) {
+		var p;
+		var prev = {};
+		var keyval;
+		var valval;
+		var id_keyname;
+		var id_value;
+		var id_prevkeyname;
+		var id_prevvalue;
+		var num_max = pairs.length - hidden;
+		if (num == num_max) {
+			p = pairs[num-1];
+			for (var k in p) {
+				if (k.indexOf('id_key') > -1) {
+					id_keyname = k;
+				} else if (k.indexOf('id_value') > -1) {
+					id_value = k;
+				}
+			}
+			$('#'+id_keyname).val('').hide();
+			$('#'+id_value).val('').hide();
+			$('#btn_remove_'+id_value).hide();
+		} else {
+			var __was_hidden_removed__ = false;
+			for (var i = num; i < num_max; i++) {
+				p = pairs[i];
+				for (var k in p) {
+					if (k.indexOf('id_key') > -1) {
+						id_keyname = k;
+					} else if (k.indexOf('id_value') > -1) {
+						id_value = k;
+					}
+				}
+				prev = pairs[i-1];
+				for (var k in prev) {
+					if (k.indexOf('id_key') > -1) {
+						id_prevkeyname = k;
+					} else if (k.indexOf('id_value') > -1) {
+						id_prevvalue = k;
+					}
+				}
+	
+				keyval = $('#'+id_keyname).val();
+				valval = $('#'+id_value).val();
+	
+				$('#'+id_prevkeyname).val(keyval);
+				$('#'+id_prevvalue).val(valval);
+				
+				if (i == hidden) {
+					$('#'+id_keyname).val('').hide();
+					$('#'+id_value).val('').hide();
+					$('#btn_remove_'+id_value).hide();
+					__was_hidden_removed__ = true;
+				}
+			}
+			if (!__was_hidden_removed__) {
+				p = pairs[pairs.length-hidden-1];
+				for (var k in p) {
+					if (k.indexOf('id_key') > -1) {
+						id_keyname = k;
+					} else if (k.indexOf('id_value') > -1) {
+						id_value = k;
+					}
+				}
+				$('#'+id_keyname).val('').hide();
+				$('#'+id_value).val('').hide();
+				$('#btn_remove_'+id_value).hide();
+			}
+		}
+	}
+	
+    var cMetadataLink = $("[href$=_project__create_metadata]"); // $('a[href="#create_project__create_metadata"]');
+    var func = function(){
+        cMetadataLink = $("[href$=_project__create_metadata]"); //$('a[href="#create_project__create_metadata"]');
+        if (cMetadataLink.length == 0) {
+            setTimeout(func,1000);
+        } else {
+            if (cMetadataLink.length > 0) {
+                cMetadataLink.click(function() {
+					$( ".input" ).each(function() {
+					  $( this ).css('width','50px');
+					});
+
+					var id_keyname1 = $("#id_keyname1");
+					if (id_keyname1) {
+						id_keyname1.css('width','100px');
+					}
+					var id_keyname2 = $("#id_keyname2");
+					var id_keyname3 = $("#id_keyname3");
+					var id_keyname4 = $("#id_keyname4");
+
+					var id_value1 = $("#id_value1");
+					if (id_value1) {
+						id_value1.css('width','100px');
+					}
+					var id_value2 = $("#id_value2");
+					var id_value3 = $("#id_value3");
+					var id_value4 = $("#id_value4");
+
+					var label_keyname_count=0
+					var label_keyvalue_count=0
+					var tds = $("td");
+					var __inputs__ = [];
+					var __vectors__ = {};
+					var inputsPtr=-1;
+					var is_keyname = false;
+					var is_value = false;
+					var actions_div = null;
+					tds.each(function() {
+					  if ($( this ).attr('class') == 'actions') {
+						  actions_div = $( this );
+						  var divs = $( this ).find("div");
+						  divs.each(function() {
+							  var __this_div__ = $( this );
+							  var klass = $( this ).attr('class');
+							  if (klass == 'control-group form-field clearfix ') {
+								var div_id = klass.split(' ').join('_')+'_'+(inputsPtr+1);
+								$( this ).css('width','150px').css('float','left').attr('id',div_id);
+								var inputs = $( this ).find("input");
+								var flag;
+								var content;
+								var btn_content;
+								var buttons;
+								var btn_id;
+								var container;
+								inputs.each(function() {
+									var __id__ = $( this ).attr('id');
+									is_keyname = (__id__.indexOf('id_keyname') > -1);
+									is_value = (__id__.indexOf('id_value') > -1);
+									if (is_keyname || is_value) {
+										$( this ).css('width','100px');
+										flag = __vectors__[__id__];
+										if (!flag) {
+											if (is_keyname) {
+											  __inputs__[inputsPtr+1] = {};
+											  __inputs__[inputsPtr+1][__id__] = $( this );
+											} else if (is_value) {
+											  __inputs__[inputsPtr+1][__id__] = $( this );
+											  __inputs__[inputsPtr+1]['parent'] = __this_div__;
+											  if (inputsPtr >= -1) {
+												  btn_id = 'btn_remove_'+__id__;
+												  container = __this_div__.find("div");
+												  if (container.length > 0) {
+													  buttons = container.find("#"+btn_id);
+													  if (buttons.length == 0) {
+														  content = container.html();
+														  btn_content = '<button id="btn_remove_'+__id__+'" name="'+__id__+'" title="Click this button to remove the metadata item to the left of this button." style="font-size: small;">Remove</button>';
+														 container.css('float','left').css('width','100px').html('<NOBR>'+content+btn_content+'</NOBR>');
+														 buttons = container.find("#"+btn_id);
+														 if (buttons.length == 1) {
+															 buttons.hide();
+															__inputs__[inputsPtr+1]['buttons'] = buttons;														 }
+													  }
+												  }
+											  }
+											 inputsPtr++;
+											}
+											__vectors__[__id__] = 1;
+										}
+									}
+								});
+								var labels = $( this ).find("label");
+								labels.each(function() {
+									var __for__ = $( this ).attr('for');
+									if (__for__.indexOf('id_key') > -1) {
+									  if (label_keyname_count > 0) {
+										$( this ).hide();
+									  }
+									  label_keyname_count++;
+									}
+									  if (__for__.indexOf('id_value') > -1) {
+										if (label_keyvalue_count > 0) {
+										  $( this ).hide();
+										}
+									  label_keyvalue_count++;
+									}
+								});
+							 }
+						  });
+					   }
+					});
+					/*
+					Business Logic:
+						Determine how many keypairs to display based on their validity.
+						
+						How many are valid?
+						  if more than 1 are valid then ?!?
+						Rules:
+							Show only consecutive valid pairs.
+							Remove button for pairs other than first which cannot be removed.
+							Add button so long as more can be added.
+					*/
+					var __keys__;
+					var id_keyname;
+					var id_value;
+					var keyval;
+					var valval;
+					var num_hidden=0;
+					for (var i = 0; i < __inputs__.length; i++) {
+						__keys__ = [];
+						for (var k in __inputs__[i]) {
+							__keys__[__keys__.length+1] = k;
+							if (k.indexOf('id_key') > -1) {
+								id_keyname = k;
+							} else if (k.indexOf('id_value') > -1) {
+								id_value = k;
+							}
+						}
+						keyval = __inputs__[i][id_keyname].val();
+						valval = __inputs__[i][id_value].val();
+						is_valid = (keyval != "") && (valval != "");
+						if ( (!is_valid) && (i > 0) ) {
+							__inputs__[i][id_keyname].hide();
+							__inputs__[i][id_value].hide();
+							num_hidden++;
+						}
+					}
+					/*
+					* Determine if the (Add) button should be shown and show it if necessary.
+					* Determine if the (Remove) button should be shown for each keypair.
+					*/
+					if (num_hidden > 0) {
+						if (actions_div) {
+							if (btn_add_metadata_keypair == null) {
+								actions_div.html(actions_div.html()+'<button id="btn_add_metadata_keypair" title="Click this button to ADD another Metadata Keypair.">ADD</button>');
+								btn_add_metadata_keypair = $('#btn_add_metadata_keypair');
+								if (btn_add_metadata_keypair.length > 0) {
+									btn_add_metadata_keypair.click(function(e) {
+										e.preventDefault();
+										var vector = collect_keypairs(__inputs__);
+										var all_visible_are_valid = vector['all_visible_are_valid'];
+										var count_hidden = vector['count_hidden'];
+										if (all_visible_are_valid && count_hidden) {
+											var nKp = vector['next_available_keypair'];
+											console.log('nKp='+nKp+', nKp["id_keyname"]='+nKp['id_keyname']+', nKp["id_value"]='+nKp['id_value']+', nKp["buttons"]='+nKp['buttons']);
+											if (nKp && (nKp['id_keyname']) && (nKp['id_value']) && (nKp['buttons'])) {
+												// {'id_keyname':p[id_keyname],'id_value':p[id_value],'parent':p['parent'],'buttons':p['buttons']}
+												console.log('nKp["id_keyname"].attr("id")='+nKp['id_keyname'].attr('id'));
+												var keywidget = $('#'+nKp['id_keyname'].attr('id'));
+												if (keywidget.length == 1) {
+													keywidget.show();
+												}
+												console.log('nKp["id_value"].attr("id")='+nKp['id_value'].attr('id'));
+												var valwidget = $('#'+nKp['id_value'].attr('id'));
+												if (valwidget.length == 1) {
+													valwidget.show();
+												}
+												console.log('nKp["buttons"].attr("id")='+nKp['buttons'].attr('id'));
+												var btnwidget = $('#'+nKp['buttons'].attr('id'));
+												if (btnwidget.length == 1) {
+													btnwidget.show();
+													btnwidget.click(function(e) {
+														e.preventDefault();
+														if (__can_delete__) {
+															var __name__ = $( this ).attr('name');
+															var __num__ = numerics(__name__);
+															vector = collect_keypairs(__inputs__);
+															count_hidden = vector['count_hidden'];
+															delete_keypair(__num__,__inputs__,count_hidden);
+															btn_add_metadata_keypair.show();
+															__can_delete__ = false;
+															setTimeout(function () {__can_delete__ = true;},250);
+														}
+													});
+												}
+											}
+											console.log('(1) count_hidden='+count_hidden);
+											if (count_hidden == 1) {
+												$( this ).hide();
+											}
+										} else {
+											console.log('(2) count_hidden='+count_hidden);
+											if (count_hidden > 0) {
+												alert( "Please double check all your metadata keypairs to make sure they are all valid otherwise you cannot add any additional metadata." );
+											} else {
+												$( this ).hide();
+											}
+										}
+										__can_delete__ = true;
+									});
+								}
+							}
+						}
+					}
+					console.log('__inputs__.length='+__inputs__.length);
+                });
+            }
+            setTimeout(func,1000);
+        }
+    };
+    setTimeout(func,1000);
+});
+    </script>
+    {% block content %}
+      <div id="container">
+        <div class='topbar'>
+          {% include "_header.html" %}
+        </div>
+        <div id='main_content'>
+          {% include "horizon/_messages.html" %}
+          {% block sidebar %}
+            {% include 'horizon/common/_sidebar.html' %}
+          {% endblock %}
+          <div id='content_body'>
+            {% block page_header %}{% endblock %}
+            {% block main %}{% endblock %}
+          </div>
+        </div>
+      </div>
+    {% endblock %}
+    <div id="footer">
+      {% block footer %}{% endblock %}
+    </div>
+    {% block js %}
+      {% include "horizon/_scripts.html" %}
+    {% endblock %}
+    <div id="modal_wrapper" />
+  </body>
+</html>

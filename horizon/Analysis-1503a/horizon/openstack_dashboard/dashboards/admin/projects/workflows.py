@@ -1,0 +1,1466 @@
+# Copyright 2012 United States Government as represented by the
+# Administrator of the National Aeronautics and Space Administration.
+# All Rights Reserved.
+#
+# Copyright 2012 Nebula, Inc.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+
+from django.conf import settings
+from django.core.urlresolvers import reverse
+from django.utils.translation import ugettext_lazy as _
+
+from horizon import exceptions
+from horizon import forms
+from horizon import messages
+from horizon import workflows
+
+import requests
+
+from openstack_dashboard import api
+from openstack_dashboard.api import base
+from openstack_dashboard.api import cinder
+from openstack_dashboard.api import keystone
+from openstack_dashboard.api import nova
+from openstack_dashboard.usage import quotas
+
+INDEX_URL = "horizon:admin:projects:index"
+ADD_USER_URL = "horizon:admin:projects:create_user"
+PROJECT_GROUP_ENABLED = keystone.VERSIONS.active >= 3
+PROJECT_USER_MEMBER_SLUG = "update_members"
+PROJECT_GROUP_MEMBER_SLUG = "update_group_members"
+
+
+class UpdateProjectQuotaAction(workflows.Action):
+    ifcb_label = _("Injected File Content Bytes")
+    metadata_items = forms.IntegerField(min_value=-1,
+                                        label=_("Metadata Items"))
+    cores = forms.IntegerField(min_value=-1, label=_("VCPUs"))
+    instances = forms.IntegerField(min_value=-1, label=_("Instances"))
+    injected_files = forms.IntegerField(min_value=-1,
+                                        label=_("Injected Files"))
+    injected_file_content_bytes = forms.IntegerField(min_value=-1,
+                                                     label=ifcb_label)
+    volumes = forms.IntegerField(min_value=-1, label=_("Volumes"))
+    snapshots = forms.IntegerField(min_value=-1, label=_("Volume Snapshots"))
+    gigabytes = forms.IntegerField(
+        min_value=-1, label=_("Total Size of Volumes and Snapshots (GB)"))
+    ram = forms.IntegerField(min_value=-1, label=_("RAM (MB)"))
+    floating_ips = forms.IntegerField(min_value=-1, label=_("Floating IPs"))
+    fixed_ips = forms.IntegerField(min_value=-1, label=_("Fixed IPs"))
+    security_groups = forms.IntegerField(min_value=-1,
+                                         label=_("Security Groups"))
+    security_group_rules = forms.IntegerField(min_value=-1,
+                                              label=_("Security Group Rules"))
+
+    # Neutron
+    security_group = forms.IntegerField(min_value=-1,
+                                        label=_("Security Groups"))
+    security_group_rule = forms.IntegerField(min_value=-1,
+                                             label=_("Security Group Rules"))
+    floatingip = forms.IntegerField(min_value=-1, label=_("Floating IPs"))
+    network = forms.IntegerField(min_value=-1, label=_("Networks"))
+    port = forms.IntegerField(min_value=-1, label=_("Ports"))
+    router = forms.IntegerField(min_value=-1, label=_("Routers"))
+    subnet = forms.IntegerField(min_value=-1, label=_("Subnets"))
+
+    def __init__(self, request, *args, **kwargs):
+        super(UpdateProjectQuotaAction, self).__init__(request,
+                                                       *args,
+                                                       **kwargs)
+        disabled_quotas = quotas.get_disabled_quotas(request)
+        for field in disabled_quotas:
+            if field in self.fields:
+                self.fields[field].required = False
+                self.fields[field].widget = forms.HiddenInput()
+
+    class Meta:
+        name = _("Quota")
+        slug = 'update_quotas'
+        help_text = _("From here you can set quotas "
+                      "(max limits) for the project.")
+
+
+class UpdateProjectQuota(workflows.Step):
+    action_class = UpdateProjectQuotaAction
+    depends_on = ("project_id",)
+    contributes = quotas.QUOTA_FIELDS
+
+
+class CreateProjectInfoAction(workflows.Action):
+    # Hide the domain_id and domain_name by default
+    domain_id = forms.CharField(label=_("Domain ID"),
+                                required=False,
+                                widget=forms.HiddenInput())
+    domain_name = forms.CharField(label=_("Domain Name"),
+                                  required=False,
+                                  widget=forms.HiddenInput())
+    name = forms.CharField(label=_("Name"),
+                           max_length=64)
+    description = forms.CharField(widget=forms.widgets.Textarea(),
+                                  label=_("Description"),
+                                  required=False)
+    enabled = forms.BooleanField(label=_("Enabled"),
+                                 required=False,
+                                 initial=True)
+
+    def __init__(self, request, *args, **kwargs):
+        super(CreateProjectInfoAction, self).__init__(request,
+                                                      *args,
+                                                      **kwargs)
+        # For keystone V3, display the two fields in read-only
+        if keystone.VERSIONS.active >= 3:
+            readonlyInput = forms.TextInput(attrs={'readonly': 'readonly'})
+            self.fields["domain_id"].widget = readonlyInput
+            self.fields["domain_name"].widget = readonlyInput
+
+    class Meta:
+        name = _("Project Info")
+        help_text = _("From here you can create a new "
+                      "project to organize users.")
+
+
+class CreateProjectInfo(workflows.Step):
+    action_class = CreateProjectInfoAction
+    contributes = ("domain_id",
+                   "domain_name",
+                   "project_id",
+                   "name",
+                   "description",
+                   "enabled")
+
+
+class UpdateProjectMembersAction(workflows.MembershipAction):
+    def __init__(self, request, *args, **kwargs):
+        super(UpdateProjectMembersAction, self).__init__(request,
+                                                         *args,
+                                                         **kwargs)
+        err_msg = _('Unable to retrieve user list. Please try again later.')
+        # Use the domain_id from the project
+        domain_id = self.initial.get("domain_id", None)
+        project_id = ''
+        if 'project_id' in self.initial:
+            project_id = self.initial['project_id']
+
+        # Get the default role
+        try:
+            default_role = api.keystone.get_default_role(self.request)
+            # Default role is necessary to add members to a project
+            if default_role is None:
+                default = getattr(settings,
+                                  "OPENSTACK_KEYSTONE_DEFAULT_ROLE", None)
+                msg = _('Could not find default role "%s" in Keystone') % \
+                    default
+                raise exceptions.NotFound(msg)
+        except Exception:
+            exceptions.handle(self.request,
+                              err_msg,
+                              redirect=reverse(INDEX_URL))
+        default_role_name = self.get_default_role_field_name()
+        self.fields[default_role_name] = forms.CharField(required=False)
+        self.fields[default_role_name].initial = default_role.id
+
+        # Get list of available users
+        all_users = []
+        try:
+            all_users = api.keystone.user_list(request,
+                                               domain=domain_id)
+        except Exception:
+            exceptions.handle(request, err_msg)
+        users_list = [(user.id, user.name) for user in all_users]
+
+        # Get list of roles
+        role_list = []
+        try:
+            role_list = api.keystone.role_list(request)
+        except Exception:
+            exceptions.handle(request,
+                              err_msg,
+                              redirect=reverse(INDEX_URL))
+        for role in role_list:
+            field_name = self.get_member_field_name(role.id)
+            label = role.name
+            self.fields[field_name] = forms.MultipleChoiceField(required=False,
+                                                                label=label)
+            self.fields[field_name].choices = users_list
+            self.fields[field_name].initial = []
+
+        # Figure out users & roles
+        if project_id:
+            try:
+                project_members = api.keystone.user_list(request,
+                                                         project=project_id)
+            except Exception:
+                exceptions.handle(request, err_msg)
+
+            for user in project_members:
+                try:
+                    roles = api.keystone.roles_for_user(self.request,
+                                                        user.id,
+                                                        project_id)
+                except Exception:
+                    exceptions.handle(request,
+                                      err_msg,
+                                      redirect=reverse(INDEX_URL))
+                for role in roles:
+                    field_name = self.get_member_field_name(role.id)
+                    self.fields[field_name].initial.append(user.id)
+
+    class Meta:
+        name = _("Project Members")
+        slug = PROJECT_USER_MEMBER_SLUG
+
+
+class UpdateProjectMembers(workflows.UpdateMembersStep):
+    action_class = UpdateProjectMembersAction
+    available_list_title = _("All Users")
+    members_list_title = _("Project Members")
+    no_available_text = _("No users found.")
+    no_members_text = _("No users.")
+
+    def contribute(self, data, context):
+        if data:
+            try:
+                roles = api.keystone.role_list(self.workflow.request)
+            except Exception:
+                exceptions.handle(self.workflow.request,
+                                  _('Unable to retrieve user list.'))
+
+            post = self.workflow.request.POST
+            for role in roles:
+                field = self.get_member_field_name(role.id)
+                context[field] = post.getlist(field)
+        return context
+
+
+class UpdateProjectGroupsAction(workflows.MembershipAction):
+    def __init__(self, request, *args, **kwargs):
+        super(UpdateProjectGroupsAction, self).__init__(request,
+                                                        *args,
+                                                        **kwargs)
+        err_msg = _('Unable to retrieve group list. Please try again later.')
+        # Use the domain_id from the project
+        domain_id = self.initial.get("domain_id", None)
+        project_id = ''
+        if 'project_id' in self.initial:
+            project_id = self.initial['project_id']
+
+        # Get the default role
+        try:
+            default_role = api.keystone.get_default_role(self.request)
+            # Default role is necessary to add members to a project
+            if default_role is None:
+                default = getattr(settings,
+                                  "OPENSTACK_KEYSTONE_DEFAULT_ROLE", None)
+                msg = _('Could not find default role "%s" in Keystone') % \
+                    default
+                raise exceptions.NotFound(msg)
+        except Exception:
+            exceptions.handle(self.request,
+                              err_msg,
+                              redirect=reverse(INDEX_URL))
+        default_role_name = self.get_default_role_field_name()
+        self.fields[default_role_name] = forms.CharField(required=False)
+        self.fields[default_role_name].initial = default_role.id
+
+        # Get list of available groups
+        all_groups = []
+        try:
+            all_groups = api.keystone.group_list(request,
+                                                 domain=domain_id)
+        except Exception:
+            exceptions.handle(request, err_msg)
+        groups_list = [(group.id, group.name) for group in all_groups]
+
+        # Get list of roles
+        role_list = []
+        try:
+            role_list = api.keystone.role_list(request)
+        except Exception:
+            exceptions.handle(request,
+                              err_msg,
+                              redirect=reverse(INDEX_URL))
+        for role in role_list:
+            field_name = self.get_member_field_name(role.id)
+            label = role.name
+            self.fields[field_name] = forms.MultipleChoiceField(required=False,
+                                                                label=label)
+            self.fields[field_name].choices = groups_list
+            self.fields[field_name].initial = []
+
+        # Figure out groups & roles
+        if project_id:
+            for group in all_groups:
+                try:
+                    roles = api.keystone.roles_for_group(self.request,
+                                                         group=group.id,
+                                                         project=project_id)
+                except Exception:
+                    exceptions.handle(request,
+                                      err_msg,
+                                      redirect=reverse(INDEX_URL))
+                for role in roles:
+                    field_name = self.get_member_field_name(role.id)
+                    self.fields[field_name].initial.append(group.id)
+
+    class Meta:
+        name = _("Project Groups")
+        slug = PROJECT_GROUP_MEMBER_SLUG
+
+
+class UpdateProjectGroups(workflows.UpdateMembersStep):
+    action_class = UpdateProjectGroupsAction
+    available_list_title = _("All Groups")
+    members_list_title = _("Project Groups")
+    no_available_text = _("No groups found.")
+    no_members_text = _("No groups.")
+
+    def contribute(self, data, context):
+        if data:
+            try:
+                roles = api.keystone.role_list(self.workflow.request)
+            except Exception:
+                exceptions.handle(self.workflow.request,
+                                  _('Unable to retrieve role list.'))
+
+            post = self.workflow.request.POST
+            for role in roles:
+                field = self.get_member_field_name(role.id)
+                context[field] = post.getlist(field)
+        return context
+
+__all__ = ('BaseForm', 'Form')
+
+NON_FIELD_ERRORS = '__all__'
+
+#####################################################################
+class CreateProjectPredefinedMetadataAction(workflows.Action):
+    managed_type = forms.ChoiceField(label=_("Managed Type (fields marked with '*' are only required for 'itomanaged' VMs)"),choices = ([('itomanaged','itomanaged'), ('nonmanaged','nonmanaged'), ]))
+    vpmo_id = forms.CharField(label=_("VPMO ID"),
+                              max_length=20,
+                              required=True)
+    mots_id = forms.CharField(label=_("MOTS ID"),
+                              max_length=20,
+                              required=True)
+    uam_role = forms.CharField(label=_("UAM Role"),
+                               max_length=20,
+                               required=True)
+    global_group = forms.CharField(label=_("Global Group"),
+                                   max_length=20,
+                                   required=False)
+    global_group_request_id = forms.CharField(label=_("Global Group Request ID"),
+                                              max_length=20,
+                                              required=False)
+    swm_attuid = forms.CharField(label=_("SWM Attuid"),
+                                 max_length=20,
+                                 required=False)
+    swm_management_group = forms.CharField(label=_("SWM Management Group"),
+                                           max_length=20,
+                                           required=False)
+
+    def __init__(self, request, *args, **kwargs):
+        super(CreateProjectPredefinedMetadataAction, self).__init__(request,
+                                                                    *args,
+                                                                    **kwargs)
+    def add_error(self, message):
+        """Adds an error to the Action's Step based on API issues."""
+        self.errors[NON_FIELD_ERRORS] = self.error_class([message])
+
+
+    def is_valid(self):
+        __retvalue__ = False
+        self.clean()
+
+        from horizon import exceptions
+
+        #-----------------------------------------------------------------#
+        import os
+        import uuid
+    
+        __cwd__ = os.path.abspath(os.curdir)
+        fOut = open('/tmp/horizon-CreateProjectPredefinedMetadataAction-data_%s.json' % (str(uuid.uuid4())), 'w')
+        print >> fOut, '1. cwd=%s\n' % (__cwd__)
+        #-----------------------------------------------------------------#
+
+        __managed_type__ = None
+        for field_name, bound_field in self.fields.items():
+            if (field_name == 'managed_type'):
+                __managed_type__ = self.request.POST.get(field_name,None)
+                print >> fOut, '2. __managed_type__=%s\n' % (__managed_type__)
+                break
+
+        print >> fOut, '3. __managed_type__=%s\n' % (__managed_type__)
+        if (__managed_type__ == 'itomanaged'):
+            __required__ = []
+            __labels__ = []
+            for field_name, bound_field in self.fields.items():
+                __labels__.append(tuple([field_name,unicode(bound_field.label)]))
+                if (field_name != 'managed_type'):
+                    if (bound_field.required):
+                        __required__.append(tuple([field_name,self.request.POST.get(field_name,None)]))
+            __required__ = dict(__required__)
+            print >> fOut, '4. __required__=%s\n' % (__required__)
+            __labels__ = dict(__labels__)
+
+            __vector__ = [(v is not None) and (len(v) > 0) for k,v in __required__.iteritems()]
+            print >> fOut, '5. __vector__=%s\n' % (__vector__)
+            if (not all(__vector__)):
+                print >> fOut, '6. ValueError !!!\n'
+                __missing__ = []
+                for k,v in __required__.iteritems():
+                    if (v is None) or ( (v is not None) and (len(v) < 1) ):
+                        __missing__.append(__labels__.get(k,k))
+                __message__ = "Unable to save your changes. The values for '%s' are required but not present." % ", ".join(__missing__)
+                self.add_error(__message__)
+            else:
+                __retvalue__ = True
+        else:
+            __retvalue__ = True
+
+        #-----------------------------------------------------------------#
+        print >> fOut, '7. data=%s' % (self.request.POST)
+
+        print >> fOut, '8. __managed_type__=%s' % (__managed_type__)
+
+        for field_name, bound_field in self.fields.items():
+            __value__ = None
+            try:
+                __value__ = self.request.POST.get(field_name,'**UNKNOWN**')
+            except Exception, ex:
+                __value__ = '%s' % (ex)
+            print >> fOut, '9. field_name=%s' % (field_name)
+            print >> fOut, '10. bound_field=%s (%s)' % (bound_field,bound_field.__dict__)
+            print >> fOut, '11. required=%s' % (bound_field.required)
+            print >> fOut, '12. widget=%s' % (bound_field.__dict__['widget'].__dict__)
+            print >> fOut, '13. value=%s' % (__value__)
+            print >> fOut, '14. label=%s' % (unicode(bound_field.label))
+            print >> fOut, '='*40
+            print >> fOut
+
+        fOut.flush()
+        fOut.close()
+        #-----------------------------------------------------------------#
+        return __retvalue__
+
+    def clean(self):
+        self.cleaned_data = {}
+        for field_name, bound_field in self.fields.items():
+            __value__ = None
+            try:
+                __value__ = self.request.POST.get(field_name,None)
+            except Exception, ex:
+                __value__ = '%s' % (ex)
+            self.cleaned_data[field_name] = __value__
+        return self.cleaned_data
+
+    class Meta:
+        name = _("Managed VMs")
+        slug = 'create_predefined_metadata'
+        help_text = _("From here you can create predefined metadata "
+                      "for projects.")
+
+class CreateProjectPredefinedMetadata(workflows.Step):
+    action_class = CreateProjectPredefinedMetadataAction
+    depends_on = ("project_id",)
+    contributes = ("managed_type",
+                   "vpmo_id",
+                   "mots_id",
+                   "uam_role",
+                   "global_group",
+                   "global_group_request_id",
+                   "swm_attuid",
+                   "swm_management_group",
+                   )
+
+#-------------------------------------------------------------------#
+class CreateProjectMetadataAction(workflows.Action):
+    keyname1 = forms.CharField(label=_("Key"),
+                              max_length=256,
+                              required=False)
+    value1 = forms.CharField(label=_("Value"),
+                            max_length=256,
+                            required=False)
+
+    keyname2 = forms.CharField(label=_("Key"),
+                              max_length=256,
+                              required=False)
+    value2 = forms.CharField(label=_("Value"),
+                            max_length=256,
+                            required=False)
+
+    keyname3 = forms.CharField(label=_("Key"),
+                              max_length=256,
+                              required=False)
+    value3 = forms.CharField(label=_("Value"),
+                            max_length=256,
+                            required=False)
+
+    keyname4 = forms.CharField(label=_("Key"),
+                              max_length=256,
+                              required=False)
+    value4 = forms.CharField(label=_("Value"),
+                            max_length=256,
+                            required=False)
+
+    keyname5 = forms.CharField(label=_("Key"),
+                              max_length=256,
+                              required=False)
+    value5 = forms.CharField(label=_("Value"),
+                            max_length=256,
+                            required=False)
+
+    keyname6 = forms.CharField(label=_("Key"),
+                              max_length=256,
+                              required=False)
+    value6 = forms.CharField(label=_("Value"),
+                            max_length=256,
+                            required=False)
+
+    keyname7 = forms.CharField(label=_("Key"),
+                              max_length=256,
+                              required=False)
+    value7 = forms.CharField(label=_("Value"),
+                            max_length=256,
+                            required=False)
+
+    keyname8 = forms.CharField(label=_("Key"),
+                              max_length=256,
+                              required=False)
+    value8 = forms.CharField(label=_("Value"),
+                            max_length=256,
+                            required=False)
+
+    keyname9 = forms.CharField(label=_("Key"),
+                              max_length=256,
+                              required=False)
+    value9 = forms.CharField(label=_("Value"),
+                            max_length=256,
+                            required=False)
+
+    keyname10 = forms.CharField(label=_("Key"),
+                               max_length=256,
+                               required=False)
+    value10 = forms.CharField(label=_("Value"),
+                             max_length=256,
+                             required=False)
+
+    keyname11 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value11 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname12 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value12 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname13 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value13 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname14 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value14 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname15 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value15 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname16 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value16 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname17 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value17 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname18 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value18 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname19 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value19 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname20 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value20 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname21 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value21 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname22 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value22 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname23 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value23 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname24 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value24 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname25 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value25 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname26 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value26 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname27 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value27 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname28 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value28 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname29 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value29 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname30 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value30 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname31 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value31 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname32 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value32 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname33 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value33 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname34 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value34 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname35 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value35 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname36 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value36 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname37 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value37 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname38 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value38 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname39 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value39 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname40 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value40 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname41 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value41 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname42 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value42 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname43 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value43 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname44 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value44 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname45 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value45 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname46 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value46 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname47 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value47 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname48 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value48 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    keyname49 = forms.CharField(label=_("Key"),
+                                max_length=256,
+                                required=False)
+    value49 = forms.CharField(label=_("Value"),
+                              max_length=256,
+                              required=False)
+
+    def __init__(self, request, *args, **kwargs):
+        super(CreateProjectMetadataAction, self).__init__(request,
+                                                          *args,
+                                                          **kwargs)
+    class Meta:
+        name = _("Metadata")
+        slug = 'create_metadata'
+        help_text = _("From here you can create adhoc metadata "
+                      "for projects.")
+
+class CreateProjectMetadata(workflows.Step):
+    action_class = CreateProjectMetadataAction
+    depends_on = ("project_id",)
+    contributes = (
+        "keyname1",
+        "value1",
+        "keyname2",
+        "value2",
+        "keyname3",
+        "value3",
+        "keyname4",
+        "value4",
+        "keyname5",
+        "value5",
+        "keyname6",
+        "value6",
+        "keyname7",
+        "value7",
+        "keyname8",
+        "value8",
+        "keyname9",
+        "value9",
+        "keyname10",
+        "value10",
+        "keyname11",
+        "value11",
+        "keyname12",
+        "value12",
+        "keyname13",
+        "value13",
+        "keyname14",
+        "value14",
+        "keyname15",
+        "value15",
+        "keyname16",
+        "value16",
+        "keyname17",
+        "value17",
+        "keyname18",
+        "value18",
+        "keyname19",
+        "value19",
+        "keyname20",
+        "value20",
+        "keyname21",
+        "value21",
+        "keyname22",
+        "value22",
+        "keyname23",
+        "value23",
+        "keyname24",
+        "value24",
+        "keyname25",
+        "value25",
+        "keyname26",
+        "value26",
+        "keyname27",
+        "value27",
+        "keyname28",
+        "value28",
+        "keyname29",
+        "value29",
+        "keyname30",
+        "value30",
+        "keyname31",
+        "value31",
+        "keyname32",
+        "value32",
+        "keyname33",
+        "value33",
+        "keyname34",
+        "value34",
+        "keyname35",
+        "value35",
+        "keyname36",
+        "value36",
+        "keyname37",
+        "value37",
+        "keyname38",
+        "value38",
+        "keyname39",
+        "value39",
+        "keyname40",
+        "value40",
+        "keyname41",
+        "value41",
+        "keyname42",
+        "value42",
+        "keyname43",
+        "value43",
+        "keyname44",
+        "value44",
+        "keyname45",
+        "value45",
+        "keyname46",
+        "value46",
+        "keyname47",
+        "value47",
+        "keyname48",
+        "value48",
+        "keyname49",
+        "value49",
+    )
+#-------------------------------------------------------------------#
+
+class CreateProject(workflows.Workflow):
+    slug = "create_project"
+    name = _("Create Project")
+    finalize_button_name = _("Create Project")
+    success_message = _('Created new project "%s".')
+    failure_message = _('Unable to create project "%s".')
+    success_url = "horizon:admin:projects:index"
+    default_steps = (CreateProjectInfo,
+                     UpdateProjectMembers,
+                     UpdateProjectQuota,
+                     CreateProjectPredefinedMetadata,
+                     CreateProjectMetadata
+                     )
+
+    def __init__(self, request=None, context_seed=None, entry_point=None,
+                 *args, **kwargs):
+        if PROJECT_GROUP_ENABLED:
+            self.default_steps = (CreateProjectInfo,
+                                  UpdateProjectMembers,
+                                  UpdateProjectGroups,
+                                  UpdateProjectQuota,
+                                  CreateProjectPredefinedMetadata,
+                                  CreateProjectMetadata
+                                  )
+        super(CreateProject, self).__init__(request=request,
+                                            context_seed=context_seed,
+                                            entry_point=entry_point,
+                                            *args,
+                                            **kwargs)
+
+    def format_status_message(self, message):
+        return message % self.context.get('name', 'unknown project')
+
+    def handle(self, request, data):
+        # create the project
+        domain_id = data['domain_id']
+        try:
+            desc = data['description']
+            self.object = api.keystone.tenant_create(request,
+                                                     name=data['name'],
+                                                     description=desc,
+                                                     enabled=data['enabled'],
+                                                     domain=domain_id)
+        except Exception:
+            exceptions.handle(request, ignore=True)
+            return False
+
+        project_id = self.object.id
+
+        # update project members
+        users_to_add = 0
+        try:
+            available_roles = api.keystone.role_list(request)
+            member_step = self.get_step(PROJECT_USER_MEMBER_SLUG)
+            # count how many users are to be added
+            for role in available_roles:
+                field_name = member_step.get_member_field_name(role.id)
+                role_list = data[field_name]
+                users_to_add += len(role_list)
+            # add new users to project
+            for role in available_roles:
+                field_name = member_step.get_member_field_name(role.id)
+                role_list = data[field_name]
+                users_added = 0
+                for user in role_list:
+                    api.keystone.add_tenant_user_role(request,
+                                                      project=project_id,
+                                                      user=user,
+                                                      role=role.id)
+                    users_added += 1
+                users_to_add -= users_added
+        except Exception:
+            if PROJECT_GROUP_ENABLED:
+                group_msg = _(", add project groups")
+            else:
+                group_msg = ""
+            exceptions.handle(request, _('Failed to add %(users_to_add)s '
+                                         'project members%(group_msg)s and '
+                                         'set project quotas.')
+                              % {'users_to_add': users_to_add,
+                                 'group_msg': group_msg})
+
+        if PROJECT_GROUP_ENABLED:
+            # update project groups
+            groups_to_add = 0
+            try:
+                available_roles = api.keystone.role_list(request)
+                member_step = self.get_step(PROJECT_GROUP_MEMBER_SLUG)
+
+                # count how many groups are to be added
+                for role in available_roles:
+                    field_name = member_step.get_member_field_name(role.id)
+                    role_list = data[field_name]
+                    groups_to_add += len(role_list)
+                # add new groups to project
+                for role in available_roles:
+                    field_name = member_step.get_member_field_name(role.id)
+                    role_list = data[field_name]
+                    groups_added = 0
+                    for group in role_list:
+                        api.keystone.add_group_role(request,
+                                                    role=role.id,
+                                                    group=group,
+                                                    project=project_id)
+                        groups_added += 1
+                    groups_to_add -= groups_added
+            except Exception:
+                exceptions.handle(request, _('Failed to add %s project groups '
+                                             'and update project quotas.'
+                                             % groups_to_add))
+
+        # Update the project quota.
+        nova_data = dict(
+            [(key, data[key]) for key in quotas.NOVA_QUOTA_FIELDS])
+        try:
+            nova.tenant_quota_update(request, project_id, **nova_data)
+
+            if base.is_service_enabled(request, 'volume'):
+                cinder_data = dict([(key, data[key]) for key in
+                                    quotas.CINDER_QUOTA_FIELDS])
+                cinder.tenant_quota_update(request,
+                                           project_id,
+                                           **cinder_data)
+
+            if api.base.is_service_enabled(request, 'network') and \
+               api.neutron.is_quotas_extension_supported(request):
+                neutron_data = dict([(key, data[key]) for key in
+                                     quotas.NEUTRON_QUOTA_FIELDS])
+                api.neutron.tenant_quota_update(request,
+                                                project_id,
+                                                **neutron_data)
+        except Exception:
+            exceptions.handle(request, _('Unable to set project quotas.'))
+
+        try:
+            import os
+            import json
+            import ConfigParser
+            __cwd__ = os.path.abspath(os.curdir)
+            __conf__ = os.sep.join([__cwd__,'horizon-database-config.conf'])
+            __has__ = False
+            __password__ = None
+            __keystone_url__ = None
+            if (os.path.exists(__conf__)):
+                __has__ = True
+                __section__ = 'horizon-database-config'
+                config = ConfigParser.RawConfigParser()
+                config.read(__conf__)
+                __password__ = config.get(__section__, 'password')
+                __keystone_url__ = config.get(__section__, 'keystone_url')
+    
+            if (__keystone_url__) and (__password__):
+                __url__ = "%s/tenants/%s/metadata" % (__keystone_url__,project_id)
+                headers = {'content-type': 'application/json', 'x-auth-token':__password__}
+                __metadata__ = {"metadata": { 'managed_type': data['managed_type'], 'vpmo_id': data['vpmo_id'], 'mots_id': data['mots_id'], 'uam_role': data['uam_role'], 'global_group': data['global_group'], 'global_group_request_id': data['global_group_request_id'], 'swm_attuid': data['swm_attuid'], 'swm_management_group': data['swm_management_group'] }}
+                __m__ = __metadata__["metadata"]
+                for i in xrange(1,50):
+                    kname = 'keyname%s' % (i)
+                    vname = 'value%s' % (i)
+                    if (data.has_key(kname)):
+                        __m__[kname] = data[kname]
+                    if (data.has_key(vname)):
+                        __m__[vname] = data[vname]
+                r = requests.put(__url__, headers=headers, data=json.dumps(__metadata__))
+
+                if (1):
+                    ##########################################
+                    import json
+                    import uuid
+                    tmpFname = '/tmp/horizon-CreateProject-workflows-1_%s.json' % (uuid.uuid4())
+                    fOut = open(tmpFname,mode='w')
+                    print >> fOut, '__url__=%s\n' % (__url__)
+                    print >> fOut, '__metadata__=%s\n' % (__metadata__)
+                    print >> fOut, '__keystone_url__=%s\n' % (__keystone_url__)
+                    print >> fOut, 'project_id=%s' % (project_id)
+                    print >> fOut, '__password__=%s\n' % (__password__)
+                    print >> fOut, 'r.status_code=%s\n' % (r.status_code)
+                    fOut.flush()
+                    fOut.close()
+                    ##########################################
+        except Exception:
+            exceptions.handle(self.request,
+                              _('Unable to retrieve project predefined metadata.'),
+                              redirect=reverse(INDEX_URL))
+
+        if (0):
+            ##########################################
+            import json
+            import uuid
+            __json__ = json.dumps(data)
+            tmpFname = '/tmp/horizon-CreateProject-workflow_%s.json' % (uuid.uuid4())
+            fOut = open(tmpFname,mode='w')
+            print >> fOut, __json__
+            fOut.flush()
+            fOut.close()
+            ##########################################
+
+        return True
+
+class UpdateProjectInfoAction(CreateProjectInfoAction):
+    enabled = forms.BooleanField(required=False, label=_("Enabled"))
+
+    class Meta:
+        name = _("Project Info")
+        slug = 'update_info'
+        help_text = _("From here you can edit the project details.")
+
+
+class UpdateProjectInfo(workflows.Step):
+    action_class = UpdateProjectInfoAction
+    depends_on = ("project_id",)
+    contributes = ("domain_id",
+                   "domain_name",
+                   "name",
+                   "description",
+                   "enabled")
+
+
+class UpdateProject(workflows.Workflow):
+    slug = "update_project"
+    name = _("Edit Project")
+    finalize_button_name = _("Save")
+    success_message = _('Modified project "%s".')
+    failure_message = _('Unable to modify project "%s".')
+    success_url = "horizon:admin:projects:index"
+    default_steps = (UpdateProjectInfo,
+                     UpdateProjectMembers,
+                     UpdateProjectQuota,
+                     CreateProjectPredefinedMetadata,
+                     CreateProjectMetadata)
+
+    def __init__(self, request=None, context_seed=None, entry_point=None,
+                 *args, **kwargs):
+        if PROJECT_GROUP_ENABLED:
+            self.default_steps = (UpdateProjectInfo,
+                                  UpdateProjectMembers,
+                                  UpdateProjectGroups,
+                                  UpdateProjectQuota,
+                                  CreateProjectPredefinedMetadata,
+                                  CreateProjectMetadata)
+
+        super(UpdateProject, self).__init__(request=request,
+                                            context_seed=context_seed,
+                                            entry_point=entry_point,
+                                            *args,
+                                            **kwargs)
+
+    def format_status_message(self, message):
+        return message % self.context.get('name', 'unknown project')
+
+    def handle(self, request, data):
+        # FIXME(gabriel): This should be refactored to use Python's built-in
+        # sets and do this all in a single "roles to add" and "roles to remove"
+        # pass instead of the multi-pass thing happening now.
+
+        project_id = data['project_id']
+
+        try:
+            import os
+            import json
+            import ConfigParser
+            __cwd__ = os.path.abspath(os.curdir)
+            __conf__ = os.sep.join([__cwd__,'horizon-database-config.conf'])
+            __has__ = False
+            __password__ = None
+            __keystone_url__ = None
+            if (os.path.exists(__conf__)):
+                __has__ = True
+                __section__ = 'horizon-database-config'
+                config = ConfigParser.RawConfigParser()
+                config.read(__conf__)
+                __password__ = config.get(__section__, 'password')
+                __keystone_url__ = config.get(__section__, 'keystone_url')
+    
+            if (__keystone_url__) and (__password__):
+                __url__ = "%s/tenants/%s/metadata" % (__keystone_url__,project_id)
+                headers = {'content-type': 'application/json', 'x-auth-token':__password__} # TO-DO - clean this up with proper authentication...
+                __metadata__ = {"metadata": { 'managed_type': data['managed_type'], 'vpmo_id': data['vpmo_id'], 'mots_id': data['mots_id'], 'uam_role': data['uam_role'], 'global_group': data['global_group'], 'global_group_request_id': data['global_group_request_id'], 'swm_attuid': data['swm_attuid'], 'swm_management_group': data['swm_management_group'] }}
+                __m__ = __metadata__["metadata"]
+                for i in xrange(1,50):
+                    kname = 'keyname%s' % (i)
+                    vname = 'value%s' % (i)
+                    if (data.has_key(kname)):
+                        __m__[kname] = data[kname]
+                    if (data.has_key(vname)):
+                        __m__[vname] = data[vname]
+
+                r = requests.put(__url__, headers=headers, data=json.dumps(__metadata__))
+
+                if (1):
+                    ##########################################
+                    import json
+                    import uuid
+                    tmpFname = '/tmp/horizon-UpdateProject-workflows-1_%s.json' % (uuid.uuid4())
+                    fOut = open(tmpFname,mode='w')
+                    print >> fOut, '__url__=%s\n' % (__url__)
+                    print >> fOut, '__metadata__=%s\n' % (__metadata__)
+                    print >> fOut, '__keystone_url__=%s\n' % (__keystone_url__)
+                    print >> fOut, 'project_id=%s' % (project_id)
+                    print >> fOut, '__password__=%s\n' % (__password__)
+                    print >> fOut, 'r.status_code=%s\n' % (r.status_code)
+                    fOut.flush()
+                    fOut.close()
+                    ##########################################
+        except Exception:
+            exceptions.handle(self.request,
+                              _('Unable to retrieve project predefined metadata.'),
+                              redirect=reverse(INDEX_URL))
+
+        domain_id = ''
+        # update project info
+        try:
+            project = api.keystone.tenant_update(
+                request,
+                project_id,
+                name=data['name'],
+                description=data['description'],
+                enabled=data['enabled'])
+            # Use the domain_id from the project if available
+            domain_id = getattr(project, "domain_id", None)
+        except Exception:
+            exceptions.handle(request, ignore=True)
+            return False
+
+        # update project members
+        users_to_modify = 0
+        # Project-user member step
+        member_step = self.get_step(PROJECT_USER_MEMBER_SLUG)
+        try:
+            # Get our role options
+            available_roles = api.keystone.role_list(request)
+            # Get the users currently associated with this project so we
+            # can diff against it.
+            project_members = api.keystone.user_list(request,
+                                                     project=project_id)
+            users_to_modify = len(project_members)
+
+            for user in project_members:
+                # Check if there have been any changes in the roles of
+                # Existing project members.
+                current_roles = api.keystone.roles_for_user(self.request,
+                                                            user.id,
+                                                            project_id)
+                current_role_ids = [role.id for role in current_roles]
+
+                for role in available_roles:
+                    field_name = member_step.get_member_field_name(role.id)
+                    # Check if the user is in the list of users with this role.
+                    if user.id in data[field_name]:
+                        # Add it if necessary
+                        if role.id not in current_role_ids:
+                            # user role has changed
+                            api.keystone.add_tenant_user_role(
+                                request,
+                                project=project_id,
+                                user=user.id,
+                                role=role.id)
+                        else:
+                            # User role is unchanged, so remove it from the
+                            # remaining roles list to avoid removing it later.
+                            index = current_role_ids.index(role.id)
+                            current_role_ids.pop(index)
+
+                # Prevent admins from doing stupid things to themselves.
+                is_current_user = user.id == request.user.id
+                is_current_project = project_id == request.user.tenant_id
+                admin_roles = [role for role in current_roles
+                               if role.name.lower() == 'admin']
+                if len(admin_roles):
+                    removing_admin = any([role.id in current_role_ids
+                                          for role in admin_roles])
+                else:
+                    removing_admin = False
+                if is_current_user and is_current_project and removing_admin:
+                    # Cannot remove "admin" role on current(admin) project
+                    msg = _('You cannot revoke your administrative privileges '
+                            'from the project you are currently logged into. '
+                            'Please switch to another project with '
+                            'administrative privileges or remove the '
+                            'administrative role manually via the CLI.')
+                    messages.warning(request, msg)
+
+                # Otherwise go through and revoke any removed roles.
+                else:
+                    for id_to_delete in current_role_ids:
+                        api.keystone.remove_tenant_user_role(
+                            request,
+                            project=project_id,
+                            user=user.id,
+                            role=id_to_delete)
+                users_to_modify -= 1
+
+            # Grant new roles on the project.
+            for role in available_roles:
+                field_name = member_step.get_member_field_name(role.id)
+                # Count how many users may be added for exception handling.
+                users_to_modify += len(data[field_name])
+            for role in available_roles:
+                users_added = 0
+                field_name = member_step.get_member_field_name(role.id)
+                for user_id in data[field_name]:
+                    if not filter(lambda x: user_id == x.id, project_members):
+                        api.keystone.add_tenant_user_role(request,
+                                                          project=project_id,
+                                                          user=user_id,
+                                                          role=role.id)
+                    users_added += 1
+                users_to_modify -= users_added
+        except Exception:
+            if PROJECT_GROUP_ENABLED:
+                group_msg = _(", update project groups")
+            else:
+                group_msg = ""
+            exceptions.handle(request, _('Failed to modify %(users_to_modify)s'
+                                         ' project members%(group_msg)s and '
+                                         'update project quotas.')
+                              % {'users_to_modify': users_to_modify,
+                                 'group_msg': group_msg})
+            return True
+
+        if PROJECT_GROUP_ENABLED:
+            # update project groups
+            groups_to_modify = 0
+            member_step = self.get_step(PROJECT_GROUP_MEMBER_SLUG)
+            try:
+                # Get the groups currently associated with this project so we
+                # can diff against it.
+                project_groups = api.keystone.group_list(request,
+                                                         domain=domain_id,
+                                                         project=project_id)
+                groups_to_modify = len(project_groups)
+                for group in project_groups:
+                    # Check if there have been any changes in the roles of
+                    # Existing project members.
+                    current_roles = api.keystone.roles_for_group(
+                        self.request,
+                        group=group.id,
+                        project=project_id)
+                    current_role_ids = [role.id for role in current_roles]
+                    for role in available_roles:
+                        # Check if the group is in the list of groups with
+                        # this role.
+                        field_name = member_step.get_member_field_name(role.id)
+                        if group.id in data[field_name]:
+                            # Add it if necessary
+                            if role.id not in current_role_ids:
+                                # group role has changed
+                                api.keystone.add_group_role(
+                                    request,
+                                    role=role.id,
+                                    group=group.id,
+                                    project=project_id)
+                            else:
+                                # Group role is unchanged, so remove it from
+                                # the remaining roles list to avoid removing it
+                                # later.
+                                index = current_role_ids.index(role.id)
+                                current_role_ids.pop(index)
+
+                    # Revoke any removed roles.
+                    for id_to_delete in current_role_ids:
+                        api.keystone.remove_group_role(request,
+                                                       role=id_to_delete,
+                                                       group=group.id,
+                                                       project=project_id)
+                    groups_to_modify -= 1
+
+                # Grant new roles on the project.
+                for role in available_roles:
+                    field_name = member_step.get_member_field_name(role.id)
+                    # Count how many groups may be added for error handling.
+                    groups_to_modify += len(data[field_name])
+                for role in available_roles:
+                    groups_added = 0
+                    field_name = member_step.get_member_field_name(role.id)
+                    for group_id in data[field_name]:
+                        if not filter(lambda x: group_id == x.id,
+                                      project_groups):
+                            api.keystone.add_group_role(request,
+                                                        role=role.id,
+                                                        group=group_id,
+                                                        project=project_id)
+                        groups_added += 1
+                    groups_to_modify -= groups_added
+            except Exception:
+                exceptions.handle(request, _('Failed to modify %s project '
+                                             'members, update project groups '
+                                             'and update project quotas.'
+                                             % groups_to_modify))
+                return True
+
+        # update the project quota
+        nova_data = dict(
+            [(key, data[key]) for key in quotas.NOVA_QUOTA_FIELDS])
+        try:
+            nova.tenant_quota_update(request,
+                                     project_id,
+                                     **nova_data)
+
+            if base.is_service_enabled(request, 'volume'):
+                cinder_data = dict([(key, data[key]) for key in
+                                    quotas.CINDER_QUOTA_FIELDS])
+                cinder.tenant_quota_update(request,
+                                           project_id,
+                                           **cinder_data)
+
+            if api.base.is_service_enabled(request, 'network') and \
+               api.neutron.is_quotas_extension_supported(request):
+                neutron_data = dict([(key, data[key]) for key in
+                                     quotas.NEUTRON_QUOTA_FIELDS])
+                api.neutron.tenant_quota_update(request,
+                                                project_id,
+                                                **neutron_data)
+            return True
+        except Exception:
+            exceptions.handle(request, _('Modified project information and '
+                                         'members, but unable to modify '
+                                         'project quotas.'))
+            return True
+
+#####################################################################
